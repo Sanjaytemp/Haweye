@@ -117,6 +117,13 @@ jobs:
           grep -E '^E ' .spark-tests.log | head -20 | while IFS= read -r line; do
             printf '::error::%s\n' "$line"
           done
+          # ...and the python frame each failure came from (file:line of the top of the
+          # traceback), because "AnalysisException" alone does not say whose SQL it was
+          # -- the last frame in jobs/ is the product code, the one before it the test.
+          grep -E '^(_/|tests/|jobs/|api/|generator/)[A-Za-z0-9_/.]+\.py:[0-9]+: in ' .spark-tests.log \
+            | tail -40 | while IFS= read -r line; do
+              printf '::error::traceback %s\n' "$line"
+            done
           if ! grep -qE '^(FAILED|ERROR)' .spark-tests.log; then
             printf '::error::the spark job failed before/around pytest - read the raw log\n'
           fi

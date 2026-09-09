@@ -86,6 +86,13 @@ def parse_transactions(df: DataFrame) -> DataFrame:
           .withColumn("parsed", F.from_json(F.col("payload_json"), TRANSACTION_SCHEMA))
     )
     return parsed.select(
+        # `payload_json` is carried on purpose, and the two consumers below are why:
+        # it is the dedupe fallback for a payload with no transaction_id, and
+        # `quarantine_rows` writes it to `raw.load_failures` so a rejected event can
+        # be replayed verbatim.  Consumers that do not want it drop it explicitly
+        # (`streaming_ingestion.process_batch` does) - the lakehouse tables have no
+        # such column, and the projection here is what decides that.
+        F.col("payload_json"),
         *[F.col(f"parsed.{name}").alias(name) for name in TYPED_FIELDS],
         F.col("parsed.raw_json"),
         F.col("parsed._corrupt_record"),
@@ -99,8 +106,7 @@ def parse_transactions(df: DataFrame) -> DataFrame:
          F.md5(F.concat_ws("|", F.coalesce(F.col("transaction_id"), F.col("payload_json")))),
      ) \
      .withColumn("ingest_ts", F.current_timestamp()) \
-     .withColumn("dt", F.to_date(F.col("event_ts_ts"))) \
-     .withColumn("payload_json", F.col("payload_json"))
+     .withColumn("dt", F.to_date(F.col("event_ts_ts")))
 
 
 def dedupe(df: DataFrame, key: str = DEDUP_KEY) -> DataFrame:

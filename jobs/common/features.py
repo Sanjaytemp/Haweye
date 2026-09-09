@@ -574,7 +574,12 @@ def ensure_feature_columns(df: DataFrame, *, include_label: bool = False) -> Dat
     for name in NUMERIC_FEATURES:
         cols.append(F.coalesce(F.col(name).cast("double"), F.lit(0.0)).alias(name))
     for c in CATEGORICAL_FEATURES:
-        cols.append(F.coalesce(F.col(c), F.lit("unknown")).alias(c))
+        # absent is not the same as NULL: `coalesce(<unresolved>, 'unknown')` fails
+        # analysis ("Invalid call to dataType on unresolved object"), so a frame that
+        # never had the column gets the literal level instead.  Same result, and the
+        # model's StringIndexer was fitted with that level (`handleInvalid="keep"`).
+        cols.append((F.coalesce(F.col(c), F.lit("unknown")) if c in out.columns
+                     else F.lit("unknown")).alias(c))
     return out.select(*cols)
 
 
