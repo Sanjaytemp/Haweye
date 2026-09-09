@@ -122,10 +122,17 @@ jobs:
           # frame list is what tells you whether the failure is in a test or in the
           # generated SQL in jobs/ (an AnalysisException without them is unactionable).
           # escape % and : BEFORE joining lines, or the %0A separators get mangled
+          # `|| true` on everything: this step exists to explain another step's
+          # failure, so it must never become the failure itself.
           awk '/^_+ test_/{if (seen) exit; seen = 1} seen' .spark-tests.log \
             | tail -45 | sed -e 's/%/%25/g' -e 's/::/%3A%3A/g' \
-            | awk 'BEGIN { ORS = "" } { printf "%s%%0A", $0 }' \
-            | { read -r body; printf '::error::first failure::%s\n' "$body"; }
+            | awk 'BEGIN { ORS = "" } { printf "%s%%0A", $0 }' > .first-failure.txt || true
+          if [ -s .first-failure.txt ]; then
+            printf '::error::first failure::%s\n' "$(cat .first-failure.txt)" || true
+          else
+            printf '::error::the run failed before pytest printed a traceback - see the raw log\n' || true
+          fi
+          exit 0
           if ! grep -qE '^(FAILED|ERROR)' .spark-tests.log; then
             printf '::error::the spark job failed before/around pytest - read the raw log\n'
           fi

@@ -571,8 +571,14 @@ def ensure_feature_columns(df: DataFrame, *, include_label: bool = False) -> Dat
         cols.append(F.col("dt"))
     if include_label and "label" in out.columns:
         cols.append(F.col("label").cast("double"))
+    final = set(out.columns)
     for name in NUMERIC_FEATURES:
-        cols.append(F.coalesce(F.col(name).cast("double"), F.lit(0.0)).alias(name))
+        # guarded rather than trusting the placeholder pass above: this helper runs on
+        # frames built by four different jobs, and `col.cast()` on an unresolved name
+        # is reported by Spark as "Invalid call to dataType on unresolved object" --
+        # an error message that names no column, i.e. the worst possible one to debug.
+        expr = (F.col(name).cast("double") if name in final else F.lit(None).cast("double"))
+        cols.append(F.coalesce(expr, F.lit(0.0)).alias(name))
     for c in CATEGORICAL_FEATURES:
         # absent is not the same as NULL: `coalesce(<unresolved>, 'unknown')` fails
         # analysis ("Invalid call to dataType on unresolved object"), so a frame that

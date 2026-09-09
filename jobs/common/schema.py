@@ -149,9 +149,20 @@ def quality_checks() -> dict[str, Column]:
 
 
 def add_quality_flags(df: DataFrame) -> DataFrame:
-    names = list(quality_checks().keys())
+    """Attach one ``qc_<check>`` boolean per rule plus the aggregate verdict.
+
+    ``F.coalesce(pred, lit(False))`` and not ``pred.fillna(False)``: ``Column`` has no
+    ``fillna``, and its ``__getattr__`` happily returns *another column* named
+    ``fillna`` -- so the typo only shows up as ``TypeError: 'Column' object is not
+    callable`` at the call, and would otherwise have been a silent "every row fails"
+    if it had resolved.  NULL means "this check could not be evaluated" (a missing
+    field on a malformed event), which is a failure, not a pass: coalescing to False
+    *before* the negation is what makes an unparseable row land in quarantine.
+    """
+    checks = quality_checks()
+    names = list(checks.keys())
     for name in names:
-        df = df.withColumn(f"qc_{name}", ~quality_checks()[name].fillna(False))
+        df = df.withColumn(f"qc_{name}", ~F.coalesce(checks[name], F.lit(False)))
     return df.withColumn("qc_failed", reduce(or_, [F.col(f"qc_{n}") for n in names])) \
              .withColumn("qc_reasons", F.array_compact(
                  F.array(*[F.when(F.col(f"qc_{n}"), F.lit(n)) for n in names])))
