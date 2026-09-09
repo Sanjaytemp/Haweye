@@ -83,7 +83,6 @@ x-airflow-common: &airflow-common
     CDC_KAFKA_SERVERS: ${CDC_KAFKA_SERVERS:-kafka-connect-kafka:29092}
   volumes:
     - ./airflow/dags:/opt/airflow/dags:ro
-    - ./airflow/tests:/opt/airflow/tests:ro
     - ./jobs:/opt/airflow/jobs:ro
     - ./infra/scripts:/opt/airflow/scripts:ro
     - ./sql:/opt/airflow/sql:ro

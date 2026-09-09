@@ -1,0 +1,4 @@
+# The model registry: version.txt (the live pointer) + v<timestamp>/ per version.
+# Written by jobs/train_model.py, read by api/serve.py — never committed.
+*
+!.gitignore

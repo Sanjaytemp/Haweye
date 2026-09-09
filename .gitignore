@@ -33,7 +33,10 @@ derby.log
 data/
 logs/
 tmp/
-artifacts/
+# artifacts/ is NOT ignored here on purpose: docker-compose bind-mounts it into the
+# spark + airflow + serving-api containers, so the directory has to exist in a fresh
+# clone (otherwise Docker creates it as root-owned and the first model publish fails
+# on a permission error).  Its contents are ignored by artifacts/.gitignore instead.
 models/local/
 .run/
 .spark-jars/
