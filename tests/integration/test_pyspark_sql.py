@@ -246,20 +246,38 @@ def test_cdc_envelope_is_flattened_for_every_op(spark):
 
 def test_feature_store_projection_roundtrips(spark):
     """`to_feature_store_layout` + `parse_feature_json` are the writer/reader pair
-    the API consumes; they must be exact inverses."""
+    behind `transactions_features`, so they must be exact inverses.
+
+    The payload has to carry the *whole* layout: the reader decodes with
+    `FEATURES_TABLE_SCHEMA` and selects every field of it, so a partial JSON (the
+    obvious way to write this test) fails on an unresolved column -- which is also
+    the failure mode a downstream consumer would hit if the feature job ever
+    published a subset.  Asserting on the typed values, not just the column names,
+    is what catches a `cast` that quietly changes a double to NULL.
+    """
     from pyspark.sql import functions as F
 
+    layout = [f.name for f in features.FEATURES_TABLE_SCHEMA.fields]
     rows = _enriched_rows()
     spark.createDataFrame(rows).createOrReplaceTempView("f")
     feats = features.ensure_feature_columns(spark.sql("SELECT * FROM f"))
     laid = features.to_feature_store_layout(feats, model_uri="s3a://x", model_version="v1")
-    assert laid.count() == len(rows)
-    payload = laid.select("transaction_id",
-                          F.to_json(F.struct(*[F.col(n) for n in features.NUMERIC_FEATURES[:5]]))
-                          .alias("value"))
+    assert laid.columns == layout, "the layout must be exactly the table schema, in order"
+
+    payload = laid.select("transaction_id", F.to_json(F.struct(*layout)).alias("value"))
     parsed = features.parse_feature_json(payload)
-    assert parsed.count() == len(rows)
-    assert set(features.NUMERIC_FEATURES[:5]) <= set(parsed.columns)
+    assert parsed.count() == len(rows), "no row may be added or lost by the projection"
+    assert set(layout) <= set(parsed.columns)
+
+    before = laid.filter("transaction_id = 'T7'").first().asDict()
+    after = parsed.filter("transaction_id = 'T7'").first().asDict()
+    for name in features.NUMERIC_FEATURES:
+        if before[name] is None:
+            continue  # absent-by-construction stays absent: both sides agree on NULL
+        assert float(after[name]) == pytest.approx(float(before[name]), abs=1e-6), (
+            f"{name}: {before[name]!r} -> {after[name]!r}")
+    # the metadata the scorer writes alongside survives the trip
+    assert after["model_version"] == "v1" and after["model_uri"] == "s3a://x"
 
 
 def test_sparkutils_helpers(spark):
