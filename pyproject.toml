@@ -1,0 +1,55 @@
+[project]
+name = "haweye"
+version = "0.1.0"
+description = "Real-time transaction monitoring, feature store and ML on Iceberg (training project)"
+requires-python = ">=3.10"
+
+# ---------------------------------------------------------------- ruff: the linter
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = [".venv", "artifacts", ".spark-jars", ".run", "node_modules", "docs"]
+
+[tool.ruff.lint]
+# E/W style, F real bugs, I imports, B bugbear, UP pyupgrade, C4 comprehensions,
+# SIM simplifications, RET early-returns.  We do NOT enable D (docstring rules):
+# this repo documents deliberately verbosely, and D would fight that.
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RET"]
+ignore = [
+  "E501",    # line length is handled by the formatter, and long comments are the point
+  "B008",    # FastAPI's Depends() in defaults is idiomatic
+  "RET504",  # "unnecessary assignment before return" is often clearer
+  "SIM105",  # try/except/pass -> contextlib.suppress is not always more readable
+  "C408",    # dict(k=...) reads better than a literal in the declarative tables
+             # (RULES in api/serve.py, the connector config), where keys align
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "B011"]      # assert in tests is the whole point
+"jobs/common/schema.py" = ["E501"]  # the schema table is a table
+
+[tool.ruff.lint.isort]
+known-first-party = ["common", "generator", "api", "jobs"]
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "spark: needs pyspark + a JVM (skipped automatically when java is missing)",
+  "docker: needs the compose stack running (opt-in, run with -m docker)",
+  "slow: takes more than ~10s",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning:pkg_resources.*",
+  "ignore::UserWarning:pyspark.*",
+]
+
+# ---------------------------------------------------------------- coverage
+[tool.coverage.run]
+source = ["jobs/common", "generator", "api"]
+omit = ["*/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

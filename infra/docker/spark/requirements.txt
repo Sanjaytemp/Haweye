@@ -1,0 +1,6 @@
+# Python packages the *executors* need (they live inside the Spark image).
+# Kept tiny on purpose: heavy deps belong in the training/serving images.
+pandas>=2.0,<2.3
+redis>=5.0
+psycopg2-binary>=2.9
+requests>=2.31

@@ -1,0 +1,31 @@
+{
+  "name": "haweye-dimensions",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres-cdc",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "debezium",
+    "database.dbname": "dimensions",
+    "topic.prefix": "cdc",
+    "schema.include.list": "public",
+    "table.include.list": "public.merchants,public.card_accounts",
+    "publication.name": "haweye_cdc",
+    "slot.name": "haweye_cdc_slot",
+    "plugin.name": "pgoutput",
+    "snapshot.mode": "initial",
+    "heartbeat.interval.ms": "10000",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "decimal.handling.mode": "double",
+    "bigint.unsafe.mode": "false",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "haweye-dimensions.dlq",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "poll.interval.ms": "500",
+    "max.batch.size": "2048",
+    "tombstones.on.delete": "false"
+  }
+}

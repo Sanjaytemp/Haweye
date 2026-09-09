@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Spark / JVM build noise (generated inside mounted volumes at runtime)
+# ---------------------------------------------------------------------------
+.spark-jars/
+.spark-cache/
+metastore_db/
+spark-warehouse/
+derby.log
+*.jar
+!infra/docker/spark/*.jar
+
+# ---------------------------------------------------------------------------
+# Local runtime state (never commit data or credentials)
+# ---------------------------------------------------------------------------
+.env
+.env.local
+data/
+logs/
+tmp/
+artifacts/
+models/local/
+.run/
+.spark-jars/
+*.pid
+.kube/
+.pytest_cache/
+.coverage
+htmlcov/
+nifi/flow/*.db
+*.lock
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store

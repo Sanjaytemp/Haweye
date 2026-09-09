@@ -1,0 +1,92 @@
+# Two jobs, run on every push and pull request:
+#   quality -> the fast gates (no docker, no JVM). Same commands as `make lint test`,
+#              so CI can never disagree with your laptop about what "passing" means.
+#   spark   -> the same tests against a real JVM, which executes the generated SQL.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  quality:
+    name: lint + unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: make lint        # ruff + compose/SQL/import validation + shell syntax
+        run: make lint
+
+      - name: make test        # pytest tests/unit (pure python, ~1s)
+        run: make test
+
+      - name: Dockerfile hygiene (advisory)
+        continue-on-error: true
+        run: docker run --rm -i hadolint/hadolint < infra/docker/spark/Dockerfile
+
+  spark:
+    name: pyspark integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # Without a JVM the spark-marked tests skip; this job exists to run them.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install pyspark + deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt pyspark==3.5.1
+
+      - name: make test-spark
+        env:
+          PYSPARK_PYTHON: python3
+          SPARK_LOCAL_IP: 127.0.0.1
+        run: make test-spark
+
+  docs:
+    name: docs and repo hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install pyyaml pytest
+      - name: every Makefile target is documented, every cited doc exists
+        run: pytest tests/unit/test_repo_contract.py -q
+      - name: markdown links resolve (relative only)
+        run: python scripts/check_docs_links.py

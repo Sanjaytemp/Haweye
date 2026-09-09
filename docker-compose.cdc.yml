@@ -1,0 +1,215 @@
+# =============================================================================
+# OPTIONAL EXTENSION — Change Data Capture for the dimension tables.
+#
+#   docker compose -f docker-compose.cdc.yml up -d        (start this stack)
+#   docker compose up -d                                  (main stack must run: spark/minio/postgres)
+#   make cdc-up                                            (both, plus register the connector)
+#
+# What it adds:
+#   postgres-cdc   the "merchant/card master" DB, with wal_level=logical
+#   kafka-connect  a *separate* Kafka (KRaft) + Connect cluster with Debezium
+#   cdc-simulator  a loop that inserts/updates/deletes dimension rows, so you can
+#                  WATCH changes travel: Postgres -> WAL -> Kafka -> Iceberg MERGE
+#   spark-cdc      a local-mode Spark driver for the merge jobs (no cluster needed)
+#
+# Why a separate Kafka?  So that the CDC stack stays a self-contained, deletable
+# experiment.  Point `CDC_KAFKA_SERVERS=kafka:29092` (and publish the Debezium
+# topics on the main cluster via Connect's `bootstrap.servers`) to merge the two.
+# =============================================================================
+name: haweye-cdc
+
+services:
+  postgres-cdc:
+    image: postgres:${POSTGRES_VERSION:-16.3}
+    container_name: haweye-postgres-cdc
+    environment:
+      POSTGRES_USER: ${CDC_PG_USER:-cdc}
+      POSTGRES_PASSWORD: ${CDC_PG_PASSWORD:-cdc}
+      POSTGRES_DB: ${CDC_PG_DB:-dimensions}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${CDC_PG_PORT:-5433}:5432"
+    # `wal_level=logical` is the *only* Postgres setting Debezium needs
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=10
+               -c max_wal_senders=10 -c hot_standby_feedback=on
+    volumes:
+      - cdc-pg-data:/var/lib/postgresql/data
+      - ./cdc/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CDC_PG_USER:-cdc} -d ${CDC_PG_DB:-dimensions}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # seed the CDC database with the same dimension profiles the generator uses
+  cdc-seed:
+    image: python:${PYTHON_VERSION:-3.11-slim-bookworm}
+    container_name: haweye-cdc-seed
+    depends_on:
+      postgres-cdc:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      PG_HOST: postgres-cdc
+      PG_PORT: "5432"
+      PG_DB: ${CDC_PG_DB:-dimensions}
+      PG_USER: ${CDC_PG_USER:-cdc}
+      PG_PASSWORD: ${CDC_PG_PASSWORD:-cdc}
+      SQL_DIR: /sql
+      GEN_SEED: ${GEN_SEED:-20240601}
+    volumes:
+      - ./generator:/app:ro
+      - ./sql:/sql:ro
+    command: >
+      bash -c "pip install -q psycopg2-binary && python seed_dimensions.py
+               --merchants ${GEN_MERCHANTS:-120} --cards ${GEN_CARDS:-200}"
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:${KAFKA_CONNECT_KAFKA_TAG:-3.6.0}
+    container_name: haweye-cdc-kafka
+    hostname: kafka-connect-kafka
+    ports:
+      - "${CDC_KAFKA_PORT:-29093}:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-connect-kafka:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-connect-kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG4J_ROOT_LOGLEVEL: WARN
+      CLUSTER_ID: ${CDC_CLUSTER_ID:-Y2RjY29ubmVjdGNsdXN0ZXJpZDAwMg}
+    volumes:
+      - cdc-kafka-data:/tmp/kraft-combined-nodes
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  connect:
+    image: debezium/connect:${DEBEZIUM_VERSION:-2.6.1.Final}
+    container_name: haweye-cdc-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-cdc:
+        condition: service_healthy
+    ports:
+      - "${CDC_CONNECT_PORT:-8083}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka-connect-kafka:29092
+      GROUP_ID: haweye-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      ENABLE_DEBEZIUM_SCRIPT_FORMAT: "true"
+      CONNECT_ERROR_CONVERTER: org.apache.kafka.connect.converters.ByteArrayConverter
+      CONNECT_ERRORS_TOLERANCE: all
+      CONNECT_ERROR_RETENTION_MS: "600000"
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connector-plugins | head -c 20 >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 45s
+
+  # makes dimension changes happen, so CDC has something to capture
+  cdc-simulator:
+    image: python:${PYTHON_VERSION:-3.11-slim-bookworm}
+    container_name: haweye-cdc-simulator
+    depends_on:
+      postgres-cdc:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      PG_HOST: postgres-cdc
+      PG_PORT: "5432"
+      PG_DB: ${CDC_PG_DB:-dimensions}
+      PG_USER: ${CDC_PG_USER:-cdc}
+      PG_PASSWORD: ${CDC_PG_PASSWORD:-cdc}
+      CDC_SIM_INTERVAL: "20"
+    volumes:
+      - ./cdc/simulator.py:/app/simulate_changes.py:ro
+    command: >
+      bash -c "pip install -q psycopg2-binary &&
+               python /app/simulate_changes.py --interval ${CDC_SIM_INTERVAL:-20}"
+    restart: unless-stopped
+    # The simulator owns no port, so "healthy" is measured on the one thing it can
+    # actually lose: the database it writes mutations to. If this goes red, the
+    # connector is not dead - the source is, and no CDC event will be produced.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,socket; socket.create_connection((os.environ['PG_HOST'], int(os.environ['PG_PORT'])), 3).close()\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # a one-process Spark (local mode) so the CDC merge works even if you did not
+  # start the main stack; `spark-submit` targets `local[*]` inside it.
+  spark-cdc:
+    image: haweye/spark-iceberg:${SPARK_VERSION:-3.5.1}
+    container_name: haweye-spark-cdc
+    depends_on:
+      connect:
+        condition: service_healthy
+    working_dir: /opt/spark/jobs
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_S3_ENDPOINT: http://minio:9000
+      LAKEHOUSE_WAREHOUSE: s3a://${S3_BUCKET:-lakehouse}/warehouse
+      LAKEHOUSE_S3_BUCKET: ${S3_BUCKET:-lakehouse}
+      SPARK_MASTER: "local[2]"
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-haweye}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-haweye}
+      SERVING_DB_URI: postgresql://lakehouse_app:${LAKEHOUSE_DB_PASSWORD:-lakehouse_app}@postgres:5432/lakehouse
+      REDIS_HOST: redis
+      KAFKA_SERVERS: kafka:29092
+      CDC_ENABLED: "true"
+      CDC_KAFKA_SERVERS: kafka-connect-kafka:29092
+    volumes:
+      - ./jobs:/opt/spark/jobs:ro
+      - ./sql:/opt/spark/sql:ro
+      - ./artifacts/models:/opt/models
+    networks:
+      - default
+      - haweye_default
+    command: >
+      bash -c "spark-submit --master local[2] /opt/spark/jobs/cdc_merge_stream.py --verbose"
+    # A spark-submit driver serves its own UI on :4040 (inside the container). If
+    # that stops answering, the streaming query died and the dimensions are going
+    # stale, while `docker ps` still shows the container "Up".
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4040/jobs/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 150s
+    profiles: ["merge"]
+
+networks:
+  default:
+  haweye_default:
+    name: haweye-fraud_default
+    external: true
+
+volumes:
+  cdc-pg-data:
+  cdc-kafka-data:
