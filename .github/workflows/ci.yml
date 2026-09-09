@@ -40,7 +40,16 @@ jobs:
         run: make lint
 
       - name: make test        # pytest tests/unit (pure python, ~1s)
-        run: make test
+        run: |
+          set -o pipefail
+          make test PYTEST_ARGS="-rf" 2>&1 | tee .unit-tests.log
+
+      - name: Report failures as annotations
+        if: failure()
+        run: |
+          grep -E '^(FAILED|ERROR)' .unit-tests.log | head -30 | while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done
 
       - name: Dockerfile hygiene (advisory)
         continue-on-error: true
@@ -90,7 +99,27 @@ jobs:
         env:
           PYSPARK_PYTHON: python3
           SPARK_LOCAL_IP: 127.0.0.1
-        run: make test-spark
+        # -rf prints the short failure list that `-q` alone hides; tee keeps it for
+        # the annotation step below. pipefail so a pytest failure still fails the step.
+        run: |
+          set -o pipefail
+          make test-spark PYTEST_ARGS="-rf --tb=short" 2>&1 | tee .spark-tests.log
+
+      - name: Report failures as annotations
+        if: failure()
+        # An Actions log needs a signed-in browser to read; annotations are in the
+        # API, so `gh pr checks` / `gh api .../annotations` shows what broke without
+        # leaving CI. One line per failing test is enough to find the file.
+        run: |
+          grep -E '^(FAILED|ERROR)' .spark-tests.log | head -30 | while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done
+          grep -E '^E ' .spark-tests.log | head -20 | while IFS= read -r line; do
+            printf '::error::%s\n' "$line"
+          done
+          if ! grep -qE '^(FAILED|ERROR)' .spark-tests.log; then
+            printf '::error::the spark job failed before/around pytest - read the raw log\n'
+          fi
 
   docs:
     name: docs and repo hygiene

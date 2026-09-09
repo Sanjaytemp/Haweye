@@ -196,11 +196,14 @@ lint:                  ## ruff + compose/SQL/import validation + docs links + sh
 		bash -n "$$f" || { echo "syntax error in $$f"; exit 1; }; done
 	@echo "shell scripts parse cleanly"
 
+# Extra pytest flags without editing the workflow: `make test-spark PYTEST_ARGS=-vv`.
+PYTEST_ARGS ?=
+
 test:                  ## Unit tests: pure python + pandas, ~10s, no docker/java
-	$(PY) -m pytest tests/unit -q
+	$(PY) -m pytest tests/unit -q $(PYTEST_ARGS)
 
 test-spark:            ## Spark-backed tests (needs java + pyspark, ~2 min)
-	$(PY) -m pytest tests/integration -q
+	$(PY) -m pytest tests/integration -q $(PYTEST_ARGS)
 
 test-all: lint test    ## What CI runs
 

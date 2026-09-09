@@ -37,6 +37,10 @@ derby.log
 .env.local
 data/
 logs/
+# CI writes these at the repo root (tee of the pytest run, for the annotation step);
+# `derby.log` above is Spark's own. Root-level only, so real log dirs still work.
+/.unit-tests.log
+/.spark-tests.log
 tmp/
 # artifacts/ is NOT ignored here on purpose: docker-compose bind-mounts it into the
 # spark + airflow + serving-api containers, so the directory has to exist in a fresh
