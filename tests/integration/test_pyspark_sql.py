@@ -36,13 +36,21 @@ def spark():
 
 
 def _txns(n=60, seed=3):
+    """The *wire* payloads, exactly as the generator produces them.
+
+    `to_payload` is not cosmetic: the simulator's rows carry real `datetime` objects,
+    and `json.dumps` of one is a TypeError. Going through the producer's own
+    serialiser is what makes this fixture the same bytes a consumer would read, which
+    is also why the unit tests for the generator assert on `to_payload` output.
+    """
     from generator import TransactionSimulator, build_cards, build_merchants
+    from generator.generator import to_payload
 
     rng = __import__("random").Random(seed)
     sim = TransactionSimulator(build_merchants(20, rng), build_cards(10, rng),
                                seed=seed, fraud_rate=0.2,
                                start=datetime(2024, 6, 1, tzinfo=timezone.utc))
-    return [txn for txn, _ in sim.stream(n)]
+    return [to_payload(txn) for txn, _ in sim.stream(n)]
 
 
 def kafka_rows(spark, payloads: list[dict], bad: list[str] | None = None):
@@ -108,15 +116,38 @@ def test_rolling_window_sql_runs_and_matches_the_pandas_oracle(spark):
 
 
 def test_derived_features_and_model_vector_build(spark):
-    events = spark.createDataFrame(_enriched_rows()).cache()
-    events.createOrReplaceTempView("enr")
-    feats = spark.sql(features.derived_features_sql("enr"))
-    assert feats.filter("amount_zscore_24h IS NOT NULL").count() >= 0
-    built = features.ensure_feature_columns(
-        feats.select("enr.*", *[c for c in feats.columns if c not in ("amount",)]))
+    """The two halves of feature construction, run in the order the job runs them.
+
+    `derived_features_sql` returns a *column list* (it is spliced into a SELECT, and
+    `rolling_features_sql` must have produced the inputs it reads), and
+    `ensure_feature_columns` has to be total: the REST/cold-start path hands it a
+    frame with a couple of columns and still expects a complete vector, not an
+    unresolved-column error.
+    """
+    import pandas as pd
+
+    spark.createDataFrame(pd.DataFrame(_enriched_rows())).createOrReplaceTempView("enr")
+    rolled = spark.sql(features.rolling_features_sql("enr"))
+    rolled.createOrReplaceTempView("rolled")
+    feats = spark.sql(f"SELECT t.*, {features.derived_features_sql('t')} FROM rolled t")
+    assert feats.count() == 12
+
+    built = features.ensure_feature_columns(feats)
     missing = set(features.model_feature_names()) - set(built.columns)
     assert not missing, f"model inputs not materialised: {missing}"
-    events.unpersist()
+    # a derived ratio is really a ratio, not a NULL: 40.0 / avg(amounts so far)
+    row = built.filter("transaction_id = 'T11'").first()
+    assert row["amount_to_limit"] == pytest.approx(120.0 / 200.0)
+
+    bare = features.ensure_feature_columns(
+        spark.createDataFrame([{"transaction_id": "T1", "amount": 12.5, "channel": None}]))
+    # no timestamp, no history, no card row: the vector still builds, the numbers it
+    # cannot know are NULL, and a missing categorical becomes the "unknown" level the
+    # StringIndexer was fitted with -- which is the difference between a cold request
+    # scoring and the micro-batch dying.
+    row = bare.select("amount_zscore_24h", "hour_of_day", "channel", "log_amount").first()
+    assert row[:3] == (None, None, "unknown"), row
+    assert row["log_amount"] == pytest.approx(float(__import__("math").log(1 + 12.5)))
 
 
 def _enriched_rows():
@@ -139,13 +170,26 @@ def _enriched_rows():
 
 
 def test_rules_sql_and_python_agree_on_real_rows(spark):
-    rows = _enriched_rows()
-    spark.createDataFrame(rows).createOrReplaceTempView("f")
-    out = rules.apply_rules(spark.sql("SELECT * FROM f")).collect()
-    for got, src in zip(out, rows, strict=True):
+    """The SQL engine and the python engine on *the same numbers*.
+
+    The frame first goes through the pandas feature oracle and then
+    `ensure_feature_columns`, because that is what the scorer actually reads (a
+    feature payload): feeding `apply_rules` a raw enriched row would leave
+    `txn_count_5min` unresolved on the SQL side and missing-to-zero on the python
+    side, i.e. the test would fail for a reason that cannot happen in production.
+    """
+    import pandas as pd
+
+    spark.createDataFrame(features.rolling_features_pandas(pd.DataFrame(_enriched_rows())))         .createOrReplaceTempView("f")
+    featured = features.ensure_feature_columns(spark.sql("SELECT * FROM f"))
+    # `apply_rules` keeps every input column (`SELECT t.*, ...`), so evaluating the
+    # python engine on the *output row* means both engines provably saw the same
+    # numbers - no ordering assumption, no second frame to keep in sync.
+    for got in rules.apply_rules(featured).collect():
+        src = got.asDict()
         expect = rules.evaluate_python(src)
-        assert sorted(got["rule_hits"]) == sorted(expect["rule_hits"]), (got["rule_hits"], expect, src)
-        assert float(got["rule_score"]) == pytest.approx(expect["rule_score"], abs=1e-3)
+        assert sorted(src["rule_hits"]) == sorted(expect["rule_hits"]), (src["rule_hits"], expect)
+        assert float(src["rule_score"]) == pytest.approx(expect["rule_score"], abs=1e-3)
 
 
 def test_final_score_formula_matches_the_blend_helper(spark):

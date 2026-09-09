@@ -232,9 +232,18 @@ def install_graceful_stop(query) -> None:
 
 # ---------------------------------------------------------------------- writes
 def table_exists(spark: SparkSession, table: str) -> bool:
-    """Simple, reliable, catalog-agnostic: can we resolve the table?"""
+    """Can we resolve this name?  Catalog-agnostic on purpose: it has to answer the
+    same way for `lake.dim.merchants`, for `dim.merchants` and for a temp view.
+
+    Resolving is the check, and `.schema` is what forces it -- cheap and total.
+    (`DataFrame.printSchema(numLines=...)` would also work but that argument only
+    exists in Spark 4; on 3.5 it raised inside the `except`, so *every* table looked
+    missing, and callers like `backfill_training_data.write_dimensions` took the
+    create branch and died on `errorifexists`.  A helper that swallows its own
+    TypeError is the reason this one touches an attribute instead of a method.)
+    """
     try:
-        spark.table(table).printSchema(numLines=0)
+        spark.table(table).schema  # noqa: B018 - reading it is the whole point
         return True
     except Exception:
         return False

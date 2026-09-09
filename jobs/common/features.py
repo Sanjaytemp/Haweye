@@ -53,14 +53,28 @@ ROLLING_WINDOWS: tuple[tuple[str, int, str | None], ...] = (
     ("intl_1h", 60 * 60, "country_mismatch = TRUE"),
 )
 
-# metric -> SQL template; {p} becomes `CASE WHEN <filter> THEN ` when filtered
+# metric -> SQL template, used for both the unfiltered windows (`AGGREGATES`, where
+# {p} qualifies the column) and the predicate-restricted ones (`FILTERED_AGGREGATES`).
+#: ``{p}`` qualifies the column (a join alias, when the same template is reused for
+#: a MERGE source); ``{w}`` is where the window spec goes.
+#:
+#: The window is injected *inside* the expression, directly after the aggregate call,
+#: and that is load-bearing: writing ``coalesce(sum(x), 0) OVER (...)`` applies the
+#: window to ``coalesce``, leaving a bare ``sum(x)`` behind, and Spark answers
+#: ``[MISSING_GROUP_BY]``. Building these strings by appending the window spec at the
+#: call site is how that bug arrives, so the templates own the position.
+#:
+#: ``distinct_merchants`` is ``size(collect_set(...))`` rather than
+#: ``count(DISTINCT ...)`` for the same reason in miniature: Spark rejects DISTINCT
+#: inside a windowed aggregate, and ``collect_set`` ignores NULLs, which is exactly
+#: what the filtered variant needs.
 AGGREGATES: dict[str, str] = {
-    "txn_count": "count({p}1)",
-    "amount_sum": "coalesce(sum({p}amount), 0)",
-    "amount_max": "coalesce(max({p}amount), 0)",
-    "amount_avg": "coalesce(avg({p}amount), 0)",
-    "amount_std": "coalesce(stddev_samp({p}amount), 0)",
-    "distinct_merchants": "count(DISTINCT {p}merchant_id)",
+    "txn_count": "count({p}1){w}",
+    "amount_sum": "coalesce(sum({p}amount){w}, 0)",
+    "amount_max": "coalesce(max({p}amount){w}, 0)",
+    "amount_avg": "coalesce(avg({p}amount){w}, 0)",
+    "amount_std": "coalesce(stddev_samp({p}amount){w}, 0)",
+    "distinct_merchants": "coalesce(size(collect_set({p}merchant_id){w}), 0)",
 }
 
 #: rolling-aggregate tables maintained by the streaming feature job
@@ -100,23 +114,32 @@ DAY_AGG_SCHEMA = StructType([
 ])
 
 
+#: same aggregates, restricted to the rows matching a predicate; every metric the
+#: unfiltered table has must appear here, because a filtered window is generated for
+#: every metric and a missing key would be a crash in the feature job.
 FILTERED_AGGREGATES = {
-    "txn_count": "count(CASE WHEN {f} THEN 1 END)",
-    "amount_sum": "coalesce(sum(CASE WHEN {f} THEN amount END), 0)",
-    "amount_max": "coalesce(max(CASE WHEN {f} THEN amount END), 0)",
-    "amount_avg": "coalesce(avg(CASE WHEN {f} THEN amount END), 0)",
-    "amount_std": "coalesce(stddev_samp(CASE WHEN {f} THEN amount END), 0)",
-    "distinct_merchants": "count(DISTINCT CASE WHEN {f} THEN merchant_id END)",
+    "txn_count": "count(CASE WHEN {f} THEN 1 END){w}",
+    "amount_sum": "coalesce(sum(CASE WHEN {f} THEN amount END){w}, 0)",
+    "amount_max": "coalesce(max(CASE WHEN {f} THEN amount END){w}, 0)",
+    "amount_avg": "coalesce(avg(CASE WHEN {f} THEN amount END){w}, 0)",
+    "amount_std": "coalesce(stddev_samp(CASE WHEN {f} THEN amount END){w}, 0)",
+    "distinct_merchants": "coalesce(size(collect_set(CASE WHEN {f} THEN merchant_id END){w}), 0)",
 }
 
 
-def _agg_expr(metric: str, window_filter: str | None) -> str:
+def _agg_expr(metric: str, window_filter: str | None, window: str = "") -> str:
+    """One aggregate expression, with the window spec in the only valid position.
+
+    ``window`` is the whole ``OVER (...)`` clause (or "" in a plain GROUP BY), and it
+    arrives here instead of being appended by the caller so that a ``coalesce``
+    wrapper cannot swallow it.
+    """
     if window_filter:
         try:
-            return FILTERED_AGGREGATES[metric].format(f=window_filter)
+            return FILTERED_AGGREGATES[metric].format(f=window_filter, w=window)
         except KeyError as exc:
             raise ValueError(f"no filtered form for metric {metric}") from exc
-    return AGGREGATES[metric].format(p="")
+    return AGGREGATES[metric].format(p="", w=window)
 
 
 #: filtered windows get a *prefix* instead of a suffix, so the generated names are
@@ -241,7 +264,7 @@ def rolling_features_sql(events_view: str) -> str:
         frame = f"RANGE BETWEEN {int(seconds)} PRECEDING AND CURRENT ROW"
         window = f"OVER (PARTITION BY e.card_id ORDER BY e.__ts {frame})"
         for metric in AGGREGATES:
-            selects.append(f"{_agg_expr(metric, window_filter)} {window} "
+            selects.append(f"{_agg_expr(metric, window_filter, window)} "
                            f"AS {feature_alias(metric, suffix)}")
     body = ",\n  ".join(selects)
     return f"""
@@ -293,7 +316,7 @@ def micro_batch_aggs_sql(view: str) -> str:
         for metric in AGGREGATES:
             if metric == "distinct_merchants":
                 continue  # needs the rolling tables to be meaningful
-            selects.append(f"{_agg_expr(metric, window_filter)} {window} "
+            selects.append(f"{_agg_expr(metric, window_filter, window)} "
                            f"AS {feature_alias(metric, suffix)}")
     body = ",\n  ".join(selects)
     return f"""
@@ -498,26 +521,51 @@ def ensure_feature_columns(df: DataFrame, *, include_label: bool = False) -> Dat
     one helper guarantees every consumer builds *the same* vector.
     """
     a = F.col
-    derived = {
-        "log_amount": F.log(1 + F.coalesce(a("amount"), F.lit(0.0))),
-        "amount_to_limit": F.when(a("credit_limit") > 0, a("amount") / F.nullif(a("credit_limit"), F.lit(0.0))),
-        "amount_to_avg_1h": F.when(a("amount_avg_1h") > 0, a("amount") / F.nullif(a("amount_avg_1h"), F.lit(0.0))),
-        "amount_zscore_24h": F.when(a("amount_std_24h") > 0,
-                                    (a("amount") - a("amount_avg_24h")) / F.nullif(a("amount_std_24h"), F.lit(0.0))),
-        "amount_vs_merchant_avg_ticket": F.when(
-            a("merchant_avg_ticket") > 0, a("amount") / F.nullif(a("merchant_avg_ticket"), F.lit(0.0))),
-        "hour_of_day": F.hour(a("event_ts_ts")),
-        "day_of_week": ((F.dayofweek(a("event_ts_ts")) + 5) % 7).cast("int"),
-        "is_night": ((F.hour(a("event_ts_ts")) < 6) | (F.hour(a("event_ts_ts")) >= 23)),
-        "is_weekend": (((F.dayofweek(a("event_ts_ts")) + 5) % 7) >= 5),
-        "amount_std_24h": F.when(a("txn_count_24h") > 1, F.coalesce(a("amount_std_24h"), F.lit(None))),
-        "amount_avg_24h": F.when(a("txn_count_24h") > 0, F.col("amount_sum_24h") / F.col("txn_count_24h")),
+    # (inputs this needs, expression) - the inputs are checked so that the helper is
+    # total: a frame that arrives without `event_ts_ts` (a hand-built REST request)
+    # gets NULL features instead of an AnalysisException about an unknown column.
+    derived: dict[str, tuple[list[str], object]] = {
+        "log_amount": (["amount"], F.log(1 + F.coalesce(a("amount"), F.lit(0.0)))),
+        "amount_to_limit": (["amount", "credit_limit"],
+                            F.when(a("credit_limit") > 0,
+                                   a("amount") / F.nullif(a("credit_limit"), F.lit(0.0)))),
+        "amount_to_avg_1h": (["amount", "amount_avg_1h"],
+                             F.when(a("amount_avg_1h") > 0,
+                                    a("amount") / F.nullif(a("amount_avg_1h"), F.lit(0.0)))),
+        "amount_zscore_24h": (["amount", "amount_avg_24h", "amount_std_24h"],
+                              F.when(a("amount_std_24h") > 0,
+                                     (a("amount") - a("amount_avg_24h"))
+                                     / F.nullif(a("amount_std_24h"), F.lit(0.0)))),
+        "amount_vs_merchant_avg_ticket": (["amount", "merchant_avg_ticket"],
+                                          F.when(a("merchant_avg_ticket") > 0,
+                                                 a("amount") / F.nullif(a("merchant_avg_ticket"), F.lit(0.0)))),
+        "hour_of_day": (["event_ts_ts"], F.hour(a("event_ts_ts"))),
+        "day_of_week": (["event_ts_ts"], ((F.dayofweek(a("event_ts_ts")) + 5) % 7).cast("int")),
+        "is_night": (["event_ts_ts"], ((F.hour(a("event_ts_ts")) < 6) | (F.hour(a("event_ts_ts")) >= 23))),
+        "is_weekend": (["event_ts_ts"], (((F.dayofweek(a("event_ts_ts")) + 5) % 7) >= 5)),
+        "amount_std_24h": (["txn_count_24h", "amount_std_24h"],
+                           F.when(a("txn_count_24h") > 1, F.coalesce(a("amount_std_24h"), F.lit(None)))),
+        "amount_avg_24h": (["txn_count_24h", "amount_sum_24h"],
+                           F.when(a("txn_count_24h") > 0, a("amount_sum_24h") / a("txn_count_24h"))),
     }
     out = df
-    for name in NUMERIC_FEATURES:
-        if name not in out.columns:
-            expr = derived.get(name, _derived_from_window(name))
-            out = out.withColumn(name, expr if expr is not None else F.lit(None))
+    missing = [name for name in NUMERIC_FEATURES if name not in out.columns]
+    # Two passes, and the order is the fix: the derived expressions reference *other
+    # features* (`amount_avg_24h` divides by `txn_count_24h`), so one loop would
+    # build them in NUMERIC_FEATURES order and throw on whichever dependency had not
+    # been added yet -- silently fine in the streaming job (the feature table has
+    # every column) and a crash for any other consumer, which is the whole reason
+    # this helper exists.  Placeholder first, derive second.
+    for name in missing:
+        out = out.withColumn(name, F.lit(None).cast("double"))
+    have = set(out.columns)
+    for name in missing:
+        spec = derived.get(name) or _derived_from_window(name)
+        if spec is None:
+            continue  # nothing to derive it from: the NULL placeholder stands
+        needs, expr = spec
+        if all(col in have for col in needs):
+            out = out.withColumn(name, expr)
     cols = [F.col(k) for k in ID_COLUMNS if k in out.columns]
     if "dt" in out.columns:
         cols.append(F.col("dt"))
@@ -530,16 +578,26 @@ def ensure_feature_columns(df: DataFrame, *, include_label: bool = False) -> Dat
     return out.select(*cols)
 
 
+#: ratios that are not in `derived` because they read dimension columns rather
+#: than other features: name -> (inputs, numerator, denominator)
+WINDOW_FREE_RATIOS = {
+    "ratio_to_merchant_avg": ("amount", "merchant_avg_ticket"),
+    "ratio_to_hourly_limit": ("amount", "txn_limit_1h"),
+}
+
+
 def _derived_from_window(name: str):
-    """Ratios that only need columns the feature table already carries."""
-    pairs = {
-        "ratio_to_merchant_avg": ("amount", "merchant_avg_ticket"),
-        "ratio_to_hourly_limit": ("amount", "txn_limit_1h"),
-    }
-    if name in pairs:
-        num, den = pairs[name]
-        return F.when(F.col(den) > 0, F.col(num) / F.nullif(F.col(den), F.lit(0.0)))
-    return None
+    """Ratios that read dimension columns instead of other features.
+
+    Returns ``(inputs, expression)`` -- the inputs are what
+    `ensure_feature_columns` checks for, so a frame without `txn_limit_1h` yields a
+    NULL feature rather than an unresolved-column error.
+    """
+    pair = WINDOW_FREE_RATIOS.get(name)
+    if pair is None:
+        return None
+    num, den = pair
+    return [num, den], F.when(F.col(den) > 0, F.col(num) / F.nullif(F.col(den), F.lit(0.0)))
 
 
 # --------------------------------------------------------------- pandas helper
