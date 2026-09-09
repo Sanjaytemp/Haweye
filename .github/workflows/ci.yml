@@ -46,10 +46,18 @@ jobs:
 
       - name: Report failures as annotations
         if: failure()
+        # GitHub keeps only ~10 annotations per check run, and one-per-line burns the
+        # budget on the summary while leaving out the traceback (which is the part
+        # that names the file).  So: two dense annotations, and never fail the step.
         run: |
-          grep -E '^(FAILED|ERROR)' .unit-tests.log | head -30 | while IFS= read -r line; do
-            printf '::error::%s\n' "$line"
-          done
+          {
+            printf '::error::failed tests::%s\n' "$(grep -E '^(FAILED|ERROR)' .unit-tests.log | head -8 | tr '\n' '|')"
+            awk '/^_+ test_/{if (seen) exit; seen = 1} seen' .unit-tests.log \
+              | tail -30 | sed -e 's/%/%25/g' -e 's/::/%3A%3A/g' \
+              | awk 'BEGIN { ORS = "" } { printf "%s%%0A", $0 }' \
+              | { read -r b; [ -n "$b" ] && printf '::error::first failure::%s\n' "$b"; }
+          } 2>/dev/null || true
+          exit 0
 
       - name: Dockerfile hygiene (advisory)
         continue-on-error: true
@@ -111,12 +119,10 @@ jobs:
         # API, so `gh pr checks` / `gh api .../annotations` shows what broke without
         # leaving CI. One line per failing test is enough to find the file.
         run: |
-          grep -E '^(FAILED|ERROR)' .spark-tests.log | head -30 | while IFS= read -r line; do
-            printf '::error::%s\n' "$line"
-          done
-          grep -E '^E ' .spark-tests.log | head -20 | while IFS= read -r line; do
-            printf '::error::%s\n' "$line"
-          done
+          {
+            printf '::error::failed tests::%s\n' "$(grep -E '^(FAILED|ERROR)' .spark-tests.log | head -8 | tr '\n' '|')"
+            grep -E '^E ' .spark-tests.log | head -12 | tr '\n' '|' | sed 's/::/%3A%3A/g' \
+              | { read -r b; [ -n "$b" ] && printf '::error::assertions::%s\n' "$b"; }
           # ...plus the first full traceback as ONE annotation: GitHub keeps ~10
           # annotations per check run, so one-per-line buries the useful part. The
           # frame list is what tells you whether the failure is in a test or in the

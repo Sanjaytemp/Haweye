@@ -47,19 +47,25 @@ def _txns(n=60, seed=3):
     from generator.generator import to_payload
 
     rng = __import__("random").Random(seed)
+    # Deliberately relative to `now`, not a fixed date: the ingestion quality gate
+    # rejects timestamps older than `SCHEMA_STALE_GUARD_DAYS` (and, separately, in the
+    # future by more than 15 minutes), so a hard-coded 2024 start made this test pass
+    # for a while and then quarantine all n rows -- a test that expires on its own is
+    # worse than one that never runs.  `start=None` would be equally wrong: the
+    # simulator then spans a day, most of it in the future.
+    start = datetime.now(timezone.utc) - timedelta(minutes=5)
     sim = TransactionSimulator(build_merchants(20, rng), build_cards(10, rng),
-                               seed=seed, fraud_rate=0.2,
-                               start=datetime(2024, 6, 1, tzinfo=timezone.utc))
+                               seed=seed, fraud_rate=0.2, start=start,
+                               end=start + timedelta(minutes=1))
     return [to_payload(txn) for txn, _ in sim.stream(n)]
 
 
 def kafka_rows(spark, payloads: list[dict], bad: list[str] | None = None):
-    rows = [(f"k{i}", json.dumps(p), "raw_transactions", 0, i,
-             datetime(2024, 6, 1, tzinfo=timezone.utc) + timedelta(seconds=i))
+    now = datetime.now(timezone.utc)
+    rows = [(f"k{i}", json.dumps(p), "raw_transactions", 0, i, now + timedelta(seconds=i))
             for i, p in enumerate(payloads)]
     for j, text in enumerate(bad or []):
-        rows.append((f"bad{j}", text, "raw_transactions", 0, 10_000 + j,
-                     datetime(2024, 6, 1, tzinfo=timezone.utc)))
+        rows.append((f"bad{j}", text, "raw_transactions", 0, 10_000 + j, now))
     return spark.createDataFrame(
         rows, "key string, value string, topic string, partition int, offset long, timestamp timestamp")
 

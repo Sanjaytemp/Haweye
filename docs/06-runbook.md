@@ -58,6 +58,11 @@ tail -50 .run/streaming_ingestion.log
    --status` execs into the container and greps `ps` for the real pids.
 2. **All rows quarantined.** Check `lake.raw.load_failures`:
    `SELECT failure_reasons, count(*) FROM lake.raw.load_failures GROUP BY 1 ORDER BY 2 DESC`
+   and read the reason before touching the pipeline: `event_time_not_stale` with a
+   *replay* of old data is the guard doing its job (`SCHEMA_STALE_GUARD_DAYS`, default
+   400 days — it exists to reject nonsense clocks, not late data), while
+   `event_time_not_in_future` on live traffic means a producer's clock or a test
+   fixture that hard-codes dates and silently expires.
    → `["corrupt_json"]` = the producer changed format; `["bad_country"]` = a
    new country not in `schema.COUNTRIES` (fix both sides; there is a test for this).
 3. **Checkpoint says "already done".** `--once --starting earliest` re-reads; if

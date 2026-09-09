@@ -9,6 +9,7 @@ table instead of killing the pipeline.
 from __future__ import annotations
 
 import json
+import os
 from functools import reduce
 from operator import and_, or_
 
@@ -60,7 +61,11 @@ COUNTRIES = (
     "VN", "PK", "BD", "RU", "UA",
 )
 DEDUP_KEY = "dedup_key"
-STALE_GUARD_DAYS = 400          # reject nonsense timestamps, not late data
+# Reject nonsense timestamps, never late data: "late" is the watermark's job
+# (`docs/04-streaming.md`), and a gate that confuses the two quarantines a replay.
+# Configurable because replaying old Kafka retention is a documented operation
+# here -- with the default, anything older than this lands in raw.load_failures.
+STALE_GUARD_DAYS = int(os.environ.get("SCHEMA_STALE_GUARD_DAYS", "400"))
 
 
 def transaction_schema() -> StructType:
