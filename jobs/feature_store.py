@@ -249,8 +249,8 @@ def _verify(spark, micro: DataFrame) -> dict:
     lo = spark.sql("SELECT min(event_ts_ts) - INTERVAL 25 HOURS AS lo FROM verify_current").first()["lo"]
     hist = spark.table(config.TABLE_ENRICHED).where(F.col("event_ts_ts") >= lo)
     unioned = hist.unionByName(current.select(*hist.columns), allowMissingColumns=True) \
-                   .where(F.col("transaction_id").isin(ids))
-    exact = features.compute_features(unioned).where(F.col("transaction_id").isin(ids))
+                   .where(sparkutils.isin("transaction_id", ids))
+    exact = features.compute_features(unioned).where(sparkutils.isin("transaction_id", ids))
     built = build_features(spark, current)
 
     diffs = {}

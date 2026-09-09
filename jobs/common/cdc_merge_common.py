@@ -10,9 +10,8 @@ for a given transaction stays queryable forever.
 from __future__ import annotations
 
 from pyspark.sql import DataFrame
-from pyspark.sql import functions as F
 
-from common import cdc, config
+from common import cdc, config, sparkutils
 
 
 def read_cdc(spark, *, streaming: bool, starting: str = "latest",
@@ -37,7 +36,9 @@ def apply_changes(spark, micro: DataFrame, *, dry_run: bool = False) -> dict:
         return {"events": 0}
     changes = cdc.parse_cdc_stream(micro)
     known = list(cdc.dimension_targets().keys())
-    changes = changes.where(F.col("source_table").isin(known))
+    # sparkutils.isin: `known` is built from dict keys (a list here), but the
+    # helper is the one form that is correct for either, and for the empty case.
+    changes = changes.where(sparkutils.isin("source_table", known))
     n = changes.count()
     if not n or dry_run:
         return {"events": n, "dry_run": dry_run}

@@ -10,6 +10,7 @@ import threading
 from collections.abc import Callable
 
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
 
 from . import config
 
@@ -231,6 +232,26 @@ def install_graceful_stop(query) -> None:
 
 
 # ---------------------------------------------------------------------- writes
+def isin(column: str, values):
+    """``F.col(column).isin(values)``, safe for whatever ``values`` actually is.
+
+    Two traps this closes, both of which are analysis-time crashes rather than wrong
+    answers -- which is how they survived the JVM-free test suite:
+
+    * pyspark's ``isin`` unwraps a single **list** argument and otherwise treats its
+      argument as *one value*.  Every allow-list in this repo is a tuple (immutable,
+      module-level), so ``isin(TUPLE)`` becomes a literal array and Spark answers
+      ``[UNSUPPORTED_FEATURE.LITERAL_TYPE] Literal for '[online, pos, atm]' of class
+      java.util.ArrayList``.
+    * ``isin([])`` means "match nothing" to a reader and raises or matches everything
+      depending on the version.  Here it is ``False``, explicitly.
+    """
+    vals = list(values)
+    if not vals:
+        return F.lit(False)
+    return F.col(column).isin(*vals)
+
+
 def table_exists(spark: SparkSession, table: str) -> bool:
     """Can we resolve this name?  Catalog-agnostic on purpose: it has to answer the
     same way for `lake.dim.merchants`, for `dim.merchants` and for a temp view.

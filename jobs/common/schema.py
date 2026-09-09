@@ -123,7 +123,18 @@ def dedupe(df: DataFrame, key: str = DEDUP_KEY) -> DataFrame:
 
 # -------------------------------------------------------------- quality gates
 def quality_checks() -> dict[str, Column]:
-    """Named boolean predicates; ``True`` means the row is *fine*."""
+    """Named boolean predicates; ``True`` means the row is *fine*.
+
+    The allow-lists go through ``sparkutils.isin`` rather than ``Column.isin``: they
+    are tuples, and pyspark reads a tuple as a single literal value, so the naive
+    form fails analysis on every micro-batch with
+    ``UNSUPPORTED_FEATURE.LITERAL_TYPE``.  (Local import: ``sparkutils`` is the
+    session/lifecycle adapter and this module is imported by tests that never touch a
+    JVM, so the dependency stays optional at import time -- same reason ``config`` is
+    imported locally below.)
+    """
+    from . import sparkutils
+    _isin = sparkutils.isin
     return {
         "has_required_fields": reduce(and_, [F.col(n).isNotNull() for n in REQUIRED_FIELDS]),
         "amount_positive": F.col("amount") > 0,
@@ -132,8 +143,8 @@ def quality_checks() -> dict[str, Column]:
         "event_time_not_in_future": F.col("event_ts_ts") <= F.current_timestamp() + F.expr("interval 15 minutes"),
         "event_time_not_stale": F.col("event_ts_ts") >= F.current_timestamp() - F.expr(f"interval {STALE_GUARD_DAYS} days"),
         "currency_ok": F.length(F.coalesce(F.col("currency"), F.lit("USD"))) == 3,
-        "channel_ok": F.col("channel").isin(CHANNELS) | F.col("channel").isNull(),
-        "country_ok": F.col("merchant_country").isin(COUNTRIES) | F.col("merchant_country").isNull(),
+        "channel_ok": _isin("channel", CHANNELS) | F.col("channel").isNull(),
+        "country_ok": _isin("merchant_country", COUNTRIES) | F.col("merchant_country").isNull(),
     }
 
 
