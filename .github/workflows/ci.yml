@@ -68,7 +68,23 @@ jobs:
       - name: Install pyspark + deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt pyspark==3.5.1
+          # requirements.txt pins the whole pyspark/numpy/pandas/pyarrow set; a bare
+          # `pip install pyspark` would pull new majors and fail in arrow internals
+          # with a crash that looks like a bug in the tests.
+          pip install -r requirements-dev.txt
+          python -VV
+          python -c "import numpy, pandas, pyarrow, pyspark; print('numpy', numpy.__version__, '| pandas', pandas.__version__, '| pyarrow', pyarrow.__version__, '| pyspark', pyspark.__version__)"
+
+      - name: Spark can start (fail loudly, not as a mystery exit code)
+        run: |
+          python - <<'PY'
+          from pyspark.sql import SparkSession
+          spark = SparkSession.builder.appName("ci-probe").master("local[1]").config(
+              "spark.ui.enabled", "false").getOrCreate()
+          print("rows:", spark.range(5).count())
+          print("pandas:", spark.createDataFrame([{"a": 1, "b": "x"}]).toPandas())
+          spark.stop()
+          PY
 
       - name: make test-spark
         env:

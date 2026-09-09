@@ -191,6 +191,10 @@ First working end-to-end implementation of the project brief.
   generator service lacked a `working_dir`, so its `command` could not find
   `generator.py`; `x-airflow-common` was defined after `services:` and its anchor
   therefore resolved to nothing.
+- `nifi/scripts/check_flow.sh` and `infra/config/mlflow/start_mlflow.sh` did not
+  exist, yet were bind-mounted by compose; both now exist and are executable, and
+  the mlflow one says plainly that `version.txt` (not MLflow) is the deployment
+  mechanism.
 - `jobs/common/io.py`: the serving DDL was read from a non-existent
   `serving_tables.sql` (now `sql/20_serving.sql`), and `SQL_DIR`/`DDL_FILE`
   relative paths resolved outside the repo when run from the repo root.
@@ -203,6 +207,37 @@ First working end-to-end implementation of the project brief.
   the scheduler could not read.
 - `train_model.py` now supports `--metrics-out`, so the nightly guardrail reads a
   file instead of scraping stdout.
+
+### Changed
+
+- `requirements.txt` now pins the whole pyspark runtime set (`numpy<2`, `pandas<2.2`,
+  `pyarrow<16`) instead of only `pyspark==3.5.1`. Spark 3.5.1's python<->JVM bridge
+  reaches into numpy and Arrow internals, so a fresh `pip install` of newer majors
+  broke `tests/integration` with an arrow-side crash that looked like a test bug.
+  The CI `spark` job prints the resolved versions and runs a two-line "can Spark
+  start and round-trip a DataFrame" probe before the suite, so an environment
+  problem is named as one.
+- `make lint` runs `ruff check .` over the whole repo (it used to cover six
+  directories, skip the files outside them, and end with `|| true`, which made the
+  gate decorative). It now also runs `scripts/check_docs_links.py` and `bash -n` on
+  every shell script, matching what the CI jobs check.
+- `Makefile` picks `.venv/bin/python` automatically when `make bootstrap` created
+  one, so `make lint`/`make test` work right after bootstrap without activating
+  the venv by hand.
+
+### Fixed
+
+- A fresh clone could not run: `./artifacts` and `./artifacts/models` are
+  bind-mounted into the spark, airflow and serving-api containers, but the
+  directories only existed locally because they were gitignored. Docker creates a
+  missing bind-mount source as a root-owned directory, so the first model publish
+  hit a permission error and `scripts/validate_compose.py` failed on every
+  clone — including CI's. The directories are now tracked with their own
+  `.gitignore` files (contents still ignored), and the unused
+  `./airflow/tests` mount was dropped from `x-airflow-common`.
+- `spark-worker`, `airflow-scheduler`, `spark-cdc` and `cdc-simulator` had no
+  `healthcheck`, so `docker compose up --wait` returned before they were
+  functional.
 
 ### Notes for anyone upgrading from a hand-assembled starting point
 

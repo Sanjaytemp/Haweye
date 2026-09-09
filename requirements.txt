@@ -2,8 +2,14 @@
 # Inside compose everything is already baked into the images, so you do not need
 # this file to run the project - only to hack on it with an IDE / debugger.
 pyspark==3.5.1
-pandas>=2.0,<2.3
-pyarrow>=14
+# The four lines below are a *set*, tested together in CI (`make test-spark`), not
+# four independent choices: Spark 3.5.1's python<->JVM bridge reaches into numpy and
+# arrow internals, and newer majors break it in ways that look unrelated
+# (AttributeError inside createDataFrame, a worker dying mid-test, exit code 2 with
+# no python traceback).  Bump pyspark and these together, then run `make test-spark`.
+numpy>=1.24,<2.0
+pandas>=2.0,<2.2
+pyarrow>=11,<16
 redis>=5.0
 psycopg2-binary>=2.9
 confluent-kafka>=2.3,<3

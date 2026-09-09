@@ -7,7 +7,12 @@ __pycache__/
 .eggs/
 build/
 dist/
+# `make bootstrap` creates .venv.  Both forms: `.venv/` alone does not match a
+# *symlinked* venv (uv, virtualenv-tools, a mounted volume), and a symlinked .venv
+# showing up in `git status` is how one ends up committed.
+.venv
 .venv/
+venv
 venv/
 .pytest_cache/
 .ruff_cache/

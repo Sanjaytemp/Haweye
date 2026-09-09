@@ -1,4 +1,6 @@
 # Everything in requirements.txt plus the dev tooling used by `make lint test`.
+# `make test` (unit) only needs the last lines; `make test-spark` needs the pyspark
+# matrix from requirements.txt, which is why this file includes it.
 -r requirements.txt
 pytest>=8.0
 ruff>=0.4
