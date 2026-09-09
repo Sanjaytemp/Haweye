@@ -1,0 +1,509 @@
+# =============================================================================
+# Project 1 — Real-Time Transaction Monitoring & Feature Store (Lakehouse + ML)
+# Main compose file: the "always-on" platform.
+#
+#   docker compose up -d                 -> core platform (Kafka, MinIO, Spark, ...)
+#   docker compose --profile airflow up  -> + orchestration
+#   docker compose --profile mlflow up   -> + experiment tracking
+#   docker compose --profile nifi up     -> + optional NiFi ingestion
+#   docker compose -f docker-compose.cdc.yml up -d   -> CDC (Debezium/Kafka Connect)
+#
+# Every value here can be overridden in a `.env` file at the repo root
+# (copy `.env.example` -> `.env`).  `scripts/bootstrap` does that for you.
+# =============================================================================
+
+name: haweye-fraud
+
+x-host-gateway: &host-gateway
+  # Lets containers reach the host network (used to talk to the published
+  # Kafka "EXTERNAL" listener).  `host-gateway` is resolved by Docker itself:
+  # 172.17.0.1 on Linux, and built-in on Docker Desktop (Mac/Windows).
+  - "host.docker.internal:host-gateway"
+
+x-aws-creds: &aws-creds
+  # MinIO speaks the S3 protocol; the Hadoop "s3a" connector and Iceberg's
+  # S3FileIO both need these three values.
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: infra/docker/airflow/Dockerfile
+    args:
+      AIRFLOW_VERSION: "${AIRFLOW_VERSION:-2.8.0}"
+      PYTHON_VERSION: "${PYTHON_VERSION:-3.11}"
+  image: haweye/airflow:${AIRFLOW_VERSION:-2.8.0}
+  user: "${AIRFLOW_UID:-0}:${AIRFLOW_GID:-0}"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    AIRFLOW_HOME: /opt/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: "1"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__LOGGING__LOGGING_LEVEL: "INFO"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-haweye-dev-secret-change-me}
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres:5432/${AIRFLOW_DB_NAME:-airflow}
+    AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    # ---------- connections declared as code (no clicking in the UI) ----------
+    AIRFLOW_CONN_LAKEHOUSE_PG: "postgres://${POSTGRES_USER:-haweye}:${POSTGRES_PASSWORD:-haweye}@postgres:5432/lakehouse"
+    AIRFLOW_CONN_CDC_PG: "postgres://${CDC_PG_USER:-cdc}:${CDC_PG_PASSWORD:-cdc}@postgres:5432/dimensions"
+    AIRFLOW_CONN_KAFKA_LOCAL: "kafka://kafka:29092"
+    # ---------- job parameters (read by the DAGs / spark-submit) ----------
+    LAKEHOUSE_WAREHOUSE: s3a://${S3_BUCKET:-lakehouse}/warehouse
+    LAKEHOUSE_S3_BUCKET: ${S3_BUCKET:-lakehouse}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    AWS_S3_ENDPOINT: http://minio:9000
+    KAFKA_SERVERS: kafka:29092
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_USER: ${POSTGRES_USER:-haweye}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-haweye}
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    SERVING_DB_URI: postgresql://lakehouse_app:${LAKEHOUSE_DB_PASSWORD:-lakehouse_app}@postgres:5432/lakehouse
+    FRAUD_MODEL_URI: s3a://${S3_BUCKET:-lakehouse}/models/fraud_rf
+    FRAUD_SCORE_THRESHOLD: ${FRAUD_SCORE_THRESHOLD:-0.6}
+    PYTHONPATH: /opt/airflow/jobs:/opt/airflow/scripts_repo
+    HAWEYE_REPO: /opt/airflow
+    HAWEYE_METRICS_FILE: /opt/airflow/logs/haweye_latest_metrics.json
+    CDC_ENABLED: ${CDC_ENABLED:-false}
+    CDC_KAFKA_SERVERS: ${CDC_KAFKA_SERVERS:-kafka-connect-kafka:29092}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./jobs:/opt/airflow/jobs:ro
+    - ./infra/scripts:/opt/airflow/scripts:ro
+    - ./sql:/opt/airflow/sql:ro
+    - ./scripts:/opt/airflow/scripts_repo:ro
+    - ./artifacts:/opt/airflow/artifacts
+    - airflow-logs:/opt/airflow/logs
+  profiles: ["airflow", "full"]
+
+services:
+  # -------------------------------------------------------------------------
+  # 1. KAFKA — the message backbone (single broker, KRaft = no ZooKeeper)
+  # -------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-server:${CONFLUENT_VERSION:-7.6.1}
+    container_name: haweye-kafka
+    hostname: kafka
+    extra_hosts: *host-gateway
+    ports:
+      - "${KAFKA_INTERNAL_PORT:-9092}:9092"      # inside the docker network
+      - "${KAFKA_HOST_PORT:-9094}:9094"         # from your laptop / host
+    environment:
+      # Two listeners: INTERNAL is what other containers must use, EXTERNAL is
+      # what processes running on your laptop (tests, notebooks) must use.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9094
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  # Small helper so "docker compose up" leaves you with a topic that exists.
+  kafka-topics:
+    image: confluentinc/cp-server:${CONFLUENT_VERSION:-7.6.1}
+    container_name: haweye-kafka-topics
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command: >
+      bash -c "
+      for t in raw_transactions transactions_features transactions_scores; do
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic $$t --partitions 3 --replication-factor 1 || true;
+      done;
+      kafka-topics --bootstrap-server kafka:29092 --list;
+      "
+
+  # -------------------------------------------------------------------------
+  # 2. MINIO — S3-compatible object store that physically holds the lakehouse
+  # -------------------------------------------------------------------------
+  minio:
+    image: minio/minio:${MINIO_VERSION:-RELEASE.2024-06-13T22-53-53Z}
+    container_name: haweye-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  minio-init:
+    image: minio/mc:${MC_VERSION:-RELEASE.2024-06-12T14-34-03Z}
+    container_name: haweye-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    entrypoint: >
+      bash -c "
+      mc alias set local http://minio:9000 $$AWS_ACCESS_KEY_ID $$AWS_SECRET_ACCESS_KEY &&
+      mc mb --ignore-existing local/${S3_BUCKET:-lakehouse} &&
+      mc version enable local/${S3_BUCKET:-lakehouse} || true;
+      echo '>>> MinIO bucket ${S3_BUCKET:-lakehouse} ready';
+      "
+
+  # -------------------------------------------------------------------------
+  # 3. POSTGRES — three logical databases in one instance:
+  #      catalog     -> Iceberg table metadata (the "glue" of the lakehouse)
+  #      lakehouse   -> dimension tables (source of truth for CDC) + serving
+  #      airflow     -> Airflow metadata
+  #    sql/*.sql are applied automatically on first boot (initdb.d).
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-16.3}
+    container_name: haweye-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-haweye}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-haweye}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=10
+        -c max_wal_senders=10
+        -c shared_preload_libraries=''
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-haweye} -d lakehouse"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # -------------------------------------------------------------------------
+  # 4. REDIS — the ONLINE feature store (low-latency key/value for scoring)
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:${REDIS_VERSION:-7.2.4-alpine}
+    container_name: haweye-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # 5. SPARK — master + worker, custom image with Iceberg / s3a / Kafka jars
+  #    baked in (see infra/docker/spark/Dockerfile; context = repo root).
+  # -------------------------------------------------------------------------
+  spark-master:
+    build:
+      context: .
+      dockerfile: infra/docker/spark/Dockerfile
+      args:
+        SPARK_VERSION: ${SPARK_VERSION:-3.5.1}
+        ICEBERG_VERSION: ${ICEBERG_VERSION:-1.5.2}
+        HADOOP_AWS_VERSION: ${HADOOP_AWS_VERSION:-3.3.4}
+        AWS_SDK_VERSION: ${AWS_SDK_VERSION:-2.25.6}
+        POSTGRES_JDBC_VERSION: ${POSTGRES_JDBC_VERSION:-42.7.3}
+    image: haweye/spark-iceberg:${SPARK_VERSION:-3.5.1}
+    container_name: haweye-spark-master
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${SPARK_UI_PORT:-8080}:8080"
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+      - "${SPARK_JOB_UI_PORT:-4040}:4040"
+    environment:
+      <<: *aws-creds
+      MODEL_ARTIFACTS_DIR: /opt/models
+      SPARK_MODE: master
+      SPARK_CLUSTER_NAME: haweye-lakehouse
+      SPARK_WORKER_MEMORY_LIMIT: 0
+      LAKEHOUSE_S3_BUCKET: ${S3_BUCKET:-lakehouse}
+      LAKEHOUSE_WAREHOUSE: s3a://${S3_BUCKET:-lakehouse}/warehouse
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-haweye}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-haweye}
+      REDIS_HOST: redis
+      KAFKA_SERVERS: kafka:29092
+      SERVING_DB_URI: postgresql://lakehouse_app:${LAKEHOUSE_DB_PASSWORD:-lakehouse_app}@postgres:5432/lakehouse
+      PYTHONPATH: /opt/spark/jobs
+      FRAUD_MODEL_URI: ${FRAUD_MODEL_URI:-s3a://lakehouse/models/fraud_rf}
+    volumes:
+      - ./jobs:/opt/spark/jobs:ro
+      - ./infra/config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./sql:/opt/spark/sql:ro
+      - ./artifacts/models:/opt/models      # shared with the serving API
+      - spark-cache:/tmp/spark-cache
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  spark-worker:
+    image: haweye/spark-iceberg:${SPARK_VERSION:-3.5.1}
+    container_name: haweye-spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      <<: *aws-creds
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      LAKEHOUSE_S3_BUCKET: ${S3_BUCKET:-lakehouse}
+      LAKEHOUSE_WAREHOUSE: s3a://${S3_BUCKET:-lakehouse}/warehouse
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-haweye}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-haweye}
+      REDIS_HOST: redis
+      KAFKA_SERVERS: kafka:29092
+      SERVING_DB_URI: postgresql://lakehouse_app:${LAKEHOUSE_DB_PASSWORD:-lakehouse_app}@postgres:5432/lakehouse
+      PYTHONPATH: /opt/spark/jobs
+      FRAUD_MODEL_URI: ${FRAUD_MODEL_URI:-s3a://lakehouse/models/fraud_rf}
+    volumes:
+      - ./jobs:/opt/spark/jobs:ro
+      - ./infra/config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./sql:/opt/spark/sql:ro
+      - spark-cache:/tmp/spark-cache
+    # The worker has its own UI (port 8081). Checking it is how `make up` learns a
+    # worker actually registered: a master is "healthy" with zero workers, and then
+    # a submit sits in ACCEPTED forever with no error anywhere.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/ > /dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # 6. GENERATOR — simulates the external acquirer feed and writes JSON to
+  #    Kafka.  This is the dependency-free replacement for NiFi (see next
+  #    section) and it is the default ingestion path of this repo.
+  # -------------------------------------------------------------------------
+  generator:
+    image: python:${PYTHON_VERSION:-3.11-slim-bookworm}
+    container_name: haweye-generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    working_dir: /app
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KAFKA_SERVERS: kafka:29092
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: lakehouse
+      PG_USER: ${POSTGRES_USER:-haweye}
+      PG_PASSWORD: ${POSTGRES_PASSWORD:-haweye}
+      GEN_RATE_PER_SEC: ${GEN_RATE_PER_SEC:-25}
+      GEN_FRAUD_RATE: ${GEN_FRAUD_RATE:-0.05}
+      GEN_HOURS: ${GEN_HOURS:-0}
+      GEN_SEED: ${GEN_SEED:-20240601}
+    volumes:
+      - ./generator:/app:ro
+    working_dir: /app
+    command: >
+      bash -c "pip install --no-cache-dir -r requirements.txt &&
+               python generator.py --bootstrap-servers \$${KAFKA_SERVERS:-kafka:29092}
+                 --rate-per-sec \$${GEN_RATE_PER_SEC:-25}
+                 --fraud-rate \$${GEN_FRAUD_RATE:-0.05}
+                 --seed \$${GEN_SEED:-20240601}
+                 \$${GEN_EXTRA_ARGS:-}"
+    profiles: ["generator", "full"]
+
+  # -------------------------------------------------------------------------
+  # 7. API — FastAPI serving layer: score a single transaction, read online
+  #    features, list alerts, refresh the model.
+  # -------------------------------------------------------------------------
+  serving-api:
+    build:
+      context: ./api
+    image: haweye/serving-api:0.1.0
+    container_name: haweye-serving-api
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      <<: *aws-creds
+      REDIS_URL: redis://redis:6379/0
+      SERVING_DB_URI: postgresql://lakehouse_app:${LAKEHOUSE_DB_PASSWORD:-lakehouse_app}@postgres:5432/lakehouse
+      LAKEHOUSE_S3_BUCKET: ${S3_BUCKET:-lakehouse}
+      AWS_S3_ENDPOINT: http://minio:9000
+      FRAUD_MODEL_URI: ${FRAUD_MODEL_URI:-s3a://lakehouse/models/fraud_rf}
+      FRAUD_SCORE_THRESHOLD: ${FRAUD_SCORE_THRESHOLD:-0.6}
+      MODEL_DIR: /opt/models
+      API_PERSIST: ${API_PERSIST:-true}
+    volumes:
+      - ./artifacts/models:/opt/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=3).status < 500 else 1)\" || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    profiles: ["api", "full"]
+
+  # -------------------------------------------------------------------------
+  # 8. NIFI (optional) — the "no-code" ingestion path from the brief.
+  #    A pre-built flow template is in nifi/flow/ and auto-deployed by
+  #    scripts/deploy_nifi_flow.py.  UI: http://localhost:8090/nifi
+  # -------------------------------------------------------------------------
+  nifi:
+    image: apache/nifi:${NIFI_VERSION:-1.27.0}
+    container_name: haweye-nifi
+    extra_hosts: *host-gateway
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${NIFI_PORT:-8090}:8080"
+    environment:
+      <<: *aws-creds
+      NIFI_WEB_HTTP_PORT: "8080"
+      NIFI_CLUSTER_IS_NODE: "false"
+      NIFI_REMOTE_CONTENT_HTTP_PORT: "8082"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./nifi/scripts:/opt/nifi/nifi-current/scripts
+      - nifi-flow:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-content:/opt/nifi/nifi-current/content_repository
+      - nifi-db:/opt/nifi/nifi-current/database_repository
+    # Opt-in on purpose: NiFi adds ~90s of startup and 1GB of heap to every
+    # `make up`, and the pipeline is identical without it (see nifi/README.md).
+    profiles: ["nifi", "full"]
+  # -------------------------------------------------------------------------
+  # 9. MLFLOW (optional) — model registry / experiment tracking
+  # -------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:${MLFLOW_VERSION:-v2.14.1}
+    container_name: haweye-mlflow
+    depends_on:
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    environment:
+      <<: *aws-creds
+      AWS_S3_ENDPOINT: http://minio:9000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_ARTIFACT_ROOT: s3://${S3_BUCKET:-lakehouse}/mlflow
+    volumes:
+      - ./infra/config/mlflow/start_mlflow.sh:/usr/bin/start_mlflow.sh:ro
+    entrypoint: ["bash", "/usr/bin/start_mlflow.sh"]
+    profiles: ["mlflow", "full"]
+
+  # -------------------------------------------------------------------------
+  # 10. AIRFLOW — orchestrator (nightly training, maintenance, quality checks)
+  #     Three containers (init / webserver / scheduler) share one definition,
+  #     declared once in `x-airflow-common` at the bottom of this file.
+  # -------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: haweye-airflow-init
+    restart: "no"
+    entrypoint: ["bash", "/opt/airflow/scripts/airflow_entrypoint.sh", "init"]
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: haweye-airflow-webserver
+    entrypoint: ["bash", "/opt/airflow/scripts/airflow_entrypoint.sh", "webserver"]
+    command: ["--port", "8080"]
+    ports:
+      - "${AIRFLOW_PORT:-8085}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: haweye-airflow-scheduler
+    entrypoint: ["bash", "/opt/airflow/scripts/airflow_entrypoint.sh", "scheduler"]
+    # The scheduler serves no port, so ask it the question Airflow itself answers:
+    # "is a SchedulerJob heartbeating from this host?". A container that is up but
+    # not parsing DAGs is otherwise indistinguishable from a working one.
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$(hostname)\" || exit 1"]
+      interval: 30s
+      timeout: 25s
+      retries: 10
+      start_period: 90s
+
+volumes:
+  minio-data:
+  postgres-data:
+  kafka-data:
+  redis-data:
+  spark-cache:
+  airflow-logs:
+  nifi-flow:
+  nifi-content:
+  nifi-db:

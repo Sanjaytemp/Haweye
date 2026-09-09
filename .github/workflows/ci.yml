@@ -1,0 +1,159 @@
+# Two jobs, run on every push and pull request:
+#   quality -> the fast gates (no docker, no JVM). Same commands as `make lint test`,
+#              so CI can never disagree with your laptop about what "passing" means.
+#   spark   -> the same tests against a real JVM, which executes the generated SQL.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  quality:
+    name: lint + unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: make lint        # ruff + compose/SQL/import validation + shell syntax
+        run: make lint
+
+      - name: make test        # pytest tests/unit (pure python, ~1s)
+        run: |
+          set -o pipefail
+          make test PYTEST_ARGS="-rf" 2>&1 | tee .unit-tests.log
+
+      - name: Report failures as annotations
+        if: failure()
+        # GitHub keeps only ~10 annotations per check run, and one-per-line burns the
+        # budget on the summary while leaving out the traceback (which is the part
+        # that names the file).  So: two dense annotations, and never fail the step.
+        run: |
+          {
+            printf '::error::failed tests::%s\n' "$(grep -E '^(FAILED|ERROR)' .unit-tests.log | head -8 | tr '\n' '|')"
+            awk '/^_+ test_/{if (seen) exit; seen = 1} seen' .unit-tests.log \
+              | tail -30 | sed -e 's/%/%25/g' -e 's/::/%3A%3A/g' \
+              | awk 'BEGIN { ORS = "" } { printf "%s%%0A", $0 }' \
+              | { read -r b; [ -n "$b" ] && printf '::error::first failure::%s\n' "$b"; }
+          } 2>/dev/null || true
+          exit 0
+
+      - name: Dockerfile hygiene (advisory)
+        continue-on-error: true
+        run: docker run --rm -i hadolint/hadolint < infra/docker/spark/Dockerfile
+
+  spark:
+    name: pyspark integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # Without a JVM the spark-marked tests skip; this job exists to run them.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install pyspark + deps
+        run: |
+          python -m pip install --upgrade pip
+          # requirements.txt pins the whole pyspark/numpy/pandas/pyarrow set; a bare
+          # `pip install pyspark` would pull new majors and fail in arrow internals
+          # with a crash that looks like a bug in the tests.
+          pip install -r requirements-dev.txt
+          python -VV
+          python -c "import numpy, pandas, pyarrow, pyspark; print('numpy', numpy.__version__, '| pandas', pandas.__version__, '| pyarrow', pyarrow.__version__, '| pyspark', pyspark.__version__)"
+
+      - name: Spark can start (fail loudly, not as a mystery exit code)
+        run: |
+          python - <<'PY'
+          from pyspark.sql import SparkSession
+          spark = SparkSession.builder.appName("ci-probe").master("local[1]").config(
+              "spark.ui.enabled", "false").getOrCreate()
+          print("rows:", spark.range(5).count())
+          print("pandas:", spark.createDataFrame([{"a": 1, "b": "x"}]).toPandas())
+          spark.stop()
+          PY
+
+      - name: make test-spark
+        env:
+          PYSPARK_PYTHON: python3
+          SPARK_LOCAL_IP: 127.0.0.1
+        # -rf prints the short failure list that `-q` alone hides; tee keeps it for
+        # the annotation step below. pipefail so a pytest failure still fails the step.
+        run: |
+          set -o pipefail
+          make test-spark PYTEST_ARGS="-rf --tb=short" 2>&1 | tee .spark-tests.log
+
+      - name: Report failures as annotations
+        if: failure()
+        # An Actions log needs a signed-in browser to read; annotations are in the
+        # API, so `gh pr checks` / `gh api .../annotations` shows what broke without
+        # leaving CI. One line per failing test is enough to find the file.
+        run: |
+          {
+            printf '::error::failed tests::%s\n' "$(grep -E '^(FAILED|ERROR)' .spark-tests.log | head -8 | tr '\n' '|')"
+            grep -E '^E ' .spark-tests.log | head -12 | tr '\n' '|' | sed 's/::/%3A%3A/g' \
+              | { read -r b; [ -n "$b" ] && printf '::error::assertions::%s\n' "$b"; }
+          # ...plus the first full traceback as ONE annotation: GitHub keeps ~10
+          # annotations per check run, so one-per-line buries the useful part. The
+          # frame list is what tells you whether the failure is in a test or in the
+          # generated SQL in jobs/ (an AnalysisException without them is unactionable).
+          # escape % and : BEFORE joining lines, or the %0A separators get mangled
+          # `|| true` on everything: this step exists to explain another step's
+          # failure, so it must never become the failure itself.
+          awk '/^_+ test_/{if (seen) exit; seen = 1} seen' .spark-tests.log \
+            | tail -45 | sed -e 's/%/%25/g' -e 's/::/%3A%3A/g' \
+            | awk 'BEGIN { ORS = "" } { printf "%s%%0A", $0 }' > .first-failure.txt || true
+          if [ -s .first-failure.txt ]; then
+            printf '::error::first failure::%s\n' "$(cat .first-failure.txt)" || true
+          else
+            printf '::error::the run failed before pytest printed a traceback - see the raw log\n' || true
+          fi
+          exit 0
+          if ! grep -qE '^(FAILED|ERROR)' .spark-tests.log; then
+            printf '::error::the spark job failed before/around pytest - read the raw log\n'
+          fi
+
+  docs:
+    name: docs and repo hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install pyyaml pytest
+      - name: every Makefile target is documented, every cited doc exists
+        run: pytest tests/unit/test_repo_contract.py -q
+      - name: markdown links resolve (relative only)
+        run: python scripts/check_docs_links.py

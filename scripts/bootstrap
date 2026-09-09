@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# One-time project setup for a fresh machine / fresh clone.
+#   ./scripts/bootstrap            # default: everything, then print next steps
+set -euo pipefail
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+die() { printf '\n\033[1;31m!! %s\033[0m\n' "$*" >&2; exit 1; }
+
+say "1/6 checking prerequisites"
+command -v docker >/dev/null 2>&1 || die "Docker is not installed.  Docs: docs/08-setup-macos-linux-windows.md"
+docker compose version >/dev/null 2>&1 || die "the 'docker compose' plugin is missing. Upgrade Docker (v2+)."
+docker info >/dev/null 2>&1 || die "the Docker daemon is not running. Start Docker Desktop (Mac/Win) or 'sudo systemctl start docker' (Linux)."
+echo "   docker: $(docker --version)"
+echo "   compose: $(docker compose version | head -1)"
+
+say "2/6 .env"
+if [[ ! -f .env ]]; then
+  cp .env.example .env
+  echo "   created .env from .env.example (edit it if a port is taken)"
+else
+  echo "   .env already exists, leaving it alone"
+fi
+# shellcheck disable=SC1091
+set -a; . ./.env; set +a
+
+say "3/6 free ports"
+for p in ${SPARK_UI_PORT}:8080 ${KAFKA_INTERNAL_PORT}:9092 ${KAFKA_HOST_PORT}:9094 ${MINIO_API_PORT}:9000 \
+         ${MINIO_CONSOLE_PORT}:9001 ${POSTGRES_PORT}:5432 ${REDIS_PORT}:6379 ${AIRFLOW_PORT}:8085 \
+         ${API_PORT}:8000 ${NIFI_PORT}:8090; do
+  host_port="${p%%:*}"
+  if command -v lsof >/dev/null 2>&1 && lsof -iTCP:"${host_port}" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "   NOTE port ${host_port} is already in use -> change it in .env (and re-run)"
+  fi
+done
+
+say "4/6 optional local python environment (for tests / running jobs on your laptop)"
+if [[ -d .venv ]]; then
+  echo "   .venv exists"
+elif command -v python3 >/dev/null 2>&1; then
+  if [[ "${WITH_VENV:-1}" == "1" ]]; then
+    python3 -m venv .venv
+    .venv/bin/pip install -q --upgrade pip
+    .venv/bin/pip install -q -r requirements-dev.txt
+    echo "   created .venv with the python tooling for tests (pyspark, pandas, pytest, ruff)"
+  fi
+else
+  echo "   python3 not found - fine, you can still run everything in Docker"
+fi
+
+say "5/6 sanity-check compose files"
+python3 scripts/validate_compose.py || {
+  if [[ -x .venv/bin/python ]]; then .venv/bin/python scripts/validate_compose.py; fi
+}
+
+say "6/6 building images (this downloads Spark + Iceberg jars, one time)"
+docker compose build spark-master
+docker compose --profile airflow build airflow-init >/dev/null 2>&1 || \
+  docker compose build airflow-init
+
+cat <<'NEXT'
+
+--------------------------------------------------------------------------
+Setup is done.  Run these in order (each one prints what it is doing):
+
+  make up                 start kafka, minio, postgres, redis, spark
+  make seed-dims          create dimension tables in Postgres (CDC source)
+  make data-backfill      create 30 days of labelled history in Iceberg
+  make train-model        train the fraud model, publish it to MinIO
+  make jobs-up            start the 3 streaming jobs
+  make gen-stream         fake acquirer traffic into Kafka (in a 2nd terminal)
+  make check              verify the whole platform
+  make cdc-up             optional: Debezium CDC for the dimension tables
+
+Browser:  http://localhost:8080 (Spark)  :9001 (MinIO)  :8085 (Airflow, admin/admin)
+Docs:     docs/00-beginner-tour.md is the long-form, step-by-step walkthrough.
+--------------------------------------------------------------------------
+NEXT

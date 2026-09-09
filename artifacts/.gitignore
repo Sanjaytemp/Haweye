@@ -1,0 +1,5 @@
+# Keep the directory in git (it is bind-mounted); ignore what is generated in it.
+*
+!gitkeep
+!.gitignore
+!models/

@@ -1,0 +1,6 @@
+apache-airflow-providers-common-sql==1.10.0
+apache-airflow-providers-apache-kafka==1.4.0
+pandas>=2.0,<2.3
+psycopg2-binary>=2.9
+redis>=5.0
+boto3>=1.34

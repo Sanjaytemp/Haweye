@@ -1,0 +1,74 @@
+# Nightly: bring the real compose stack up and push a transaction through every
+# stage (Kafka -> Spark -> Iceberg -> Redis/Postgres -> REST).  This is the test
+# that catches "the image build changed" and "Iceberg 1.5.2 does not like my SQL".
+# Kept out of PR CI because it needs docker-in-docker and ~15 minutes.
+name: Nightly stack E2E
+
+on:
+  schedule:
+    - cron: "15 4 * * *"        # 04:15 UTC
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: docker compose end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free disk + start the stack
+        run: |
+          df -h / || true
+          cp .env.example .env
+          docker compose build spark-master
+          docker compose up -d --wait postgres minio kafka redis
+
+      - name: Seed dimensions + backfill 1 day of history
+        run: |
+          make seed-dims
+          ./jobs/submit/run_job.sh backfill_training_data --days 1 --rows-per-day 3000
+
+      - name: Streaming ingestion (bounded, one trigger)
+        run: |
+          docker compose run --rm -v "$PWD/generator:/work" -w /work \
+            -e KAFKA_SERVERS=kafka:29092 --entrypoint bash python:3.11-slim-bookworm \
+            -c "pip install -q confluent-kafka && python generator.py --count 300 --rate-per-sec 100"
+          ./jobs/submit/run_job.sh streaming_ingestion --once --starting earliest
+
+      - name: Feature store + scoring (bounded)
+        run: |
+          ./jobs/submit/run_job.sh feature_store --once --starting earliest
+          ./jobs/submit/run_job.sh real_time_scoring --once --starting earliest
+
+      - name: Train a tiny model and check the metrics
+        run: |
+          ./jobs/submit/run_job.sh train_model --days 2 --holdout-days 1 \
+            --num-trees 12 --max-depth 4 --min-auc-to-publish 0.0 --publish true
+          ./jobs/submit/run_job.sh model_refresh --current
+
+      - name: CDC parity (Debezium -> Kafka -> Iceberg MERGE)
+        run: |
+          docker compose -f docker-compose.cdc.yml up -d --wait postgres-cdc kafka connect
+          ./cdc/register_connector.sh
+          sleep 25
+          ./jobs/submit/run_job.sh cdc_merge_batch --mirror-postgres
+          python scripts/check_cdc_parity.py
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --tail=200 spark-master || true
+          docker compose logs --tail=120 kafka || true
+          docker compose -f docker-compose.cdc.yml logs --tail=150 connect || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stack-logs
+          path: /tmp/haweye-*.log
+          if-no-files-found: ignore

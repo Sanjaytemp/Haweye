@@ -1,0 +1,22 @@
+# Keeps the docker build context small and *reproducible*.
+# NOTE: the Spark Dockerfile needs `jobs/`, `infra/`, `sql/`, `airflow/` and
+# `api/` (for the serving image), so never add those wholesale.
+.git
+.github
+.idea
+.vscode
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.env
+.env.*
+data/
+logs/
+tmp/
+artifacts/
+models/
+*.md
+!README.md
+!docs/**/*.md
